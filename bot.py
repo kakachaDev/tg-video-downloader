@@ -203,6 +203,7 @@ async def _auto_update_ytdlp(context) -> None:
         )
         if result.returncode == 0:
             logger.info("yt-dlp updated, restarting process…")
+            Path("bot.pid").unlink(missing_ok=True)
             os.execv(sys.executable, [sys.executable] + sys.argv)
         else:
             logger.warning("yt-dlp update failed: %s", result.stderr)
