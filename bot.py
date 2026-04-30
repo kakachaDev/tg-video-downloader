@@ -211,7 +211,9 @@ async def _auto_update_ytdlp(context) -> None:
         logger.error("yt-dlp auto-update error: %s", exc)
 
 
-def _extract_youtube_url(text: str) -> str | None:
+def _extract_url(text: str) -> str | None:
+    """Return a normalized URL if text contains a supported platform link."""
+    # YouTube
     m = re.search(
         r"https?://(?:(?:www|m)\.)?(?:"
         r"youtube\.com/watch\?[^\s]*v=[\w\-_]+"
@@ -220,13 +222,34 @@ def _extract_youtube_url(text: str) -> str | None:
         r")",
         text,
     )
-    if not m:
-        return None
-    video_id = _get_video_id(m.group(0))
-    return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+    if m:
+        vid = _get_media_id(m.group(0))
+        return f"https://www.youtube.com/watch?v={vid}" if vid else None
+
+    # TikTok
+    m = re.search(
+        r"https?://(?:www\.tiktok\.com/@[\w.]+/video/\d+"
+        r"|(?:vm|vt)\.tiktok\.com/[\w]+"
+        r"|www\.tiktok\.com/t/[\w]+)",
+        text,
+    )
+    if m:
+        return m.group(0).split("?")[0]
+
+    # Instagram
+    m = re.search(
+        r"https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/[\w\-]+",
+        text,
+    )
+    if m:
+        return m.group(0).split("?")[0].rstrip("/")
+
+    return None
 
 
-def _get_video_id(url: str) -> str | None:
+def _get_media_id(url: str) -> str | None:
+    """Return a platform-namespaced unique ID for any supported URL."""
+    # YouTube (no prefix — backward-compatible with existing file_cache)
     for pattern in (
         r"[?&]v=([\w\-_]{11})",
         r"youtu\.be/([\w\-_]{11})",
@@ -235,7 +258,43 @@ def _get_video_id(url: str) -> str | None:
         m = re.search(pattern, url)
         if m:
             return m.group(1)
+
+    # TikTok — full URL with numeric video ID
+    m = re.search(r"tiktok\.com/@[^/]+/video/(\d+)", url)
+    if m:
+        return f"tt_{m.group(1)}"
+    # TikTok — short URL (vm./vt.) or /t/ path
+    m = re.search(r"(?:vm|vt)\.tiktok\.com/([\w]+)", url)
+    if m:
+        return f"tt_{m.group(1)}"
+    m = re.search(r"tiktok\.com/t/([\w]+)", url)
+    if m:
+        return f"tt_{m.group(1)}"
+
+    # Instagram
+    m = re.search(r"instagram\.com/(?:p|reel|tv)/([\w\-]+)", url)
+    if m:
+        return f"ig_{m.group(1)}"
+
     return None
+
+
+def _reconstruct_url(media_id: str) -> str:
+    """Rebuild a download URL from a media_id when the in-memory cache is cold."""
+    if media_id.startswith("tt_"):
+        code = media_id[3:]
+        return f"https://www.tiktok.com/video/{code}" if code.isdigit() else f"https://vm.tiktok.com/{code}"
+    if media_id.startswith("ig_"):
+        return f"https://www.instagram.com/p/{media_id[3:]}/"
+    return f"https://www.youtube.com/watch?v={media_id}"
+
+
+def _platform_name(url: str) -> str:
+    if "tiktok.com" in url:
+        return "TikTok"
+    if "instagram.com" in url:
+        return "Instagram"
+    return "YouTube"
 
 
 async def _fetch_video_info(url: str) -> dict | None:
@@ -262,10 +321,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     username = context.bot.username
     await update.message.reply_html(
         f"👋 <b>Привет!</b>\n\n"
-        f"Я скачиваю видео и аудио с YouTube прямо в чат.\n\n"
+        f"Я скачиваю видео и аудио с YouTube, TikTok и Instagram прямо в чат.\n\n"
         f"<b>Как пользоваться:</b>\n"
         f"В любом чате напишите:\n"
-        f"<code>@{username} https://youtu.be/...</code>\n\n"
+        f"<code>@{username} https://youtu.be/...</code>\n"
+        f"<code>@{username} https://www.tiktok.com/...</code>\n"
+        f"<code>@{username} https://www.instagram.com/reel/...</code>\n\n"
         f"Выберите качество из предложенных вариантов — "
         f"и файл появится в чате."
     )
@@ -319,38 +380,38 @@ def _cookie_mtime() -> str:
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query_text = update.inline_query.query.strip()
     logger.info("inline_query from user=%d: %r", update.effective_user.id, query_text)
-    url = _extract_youtube_url(query_text)
+    url = _extract_url(query_text)
 
     if not url:
         await update.inline_query.answer(
             [],
             cache_time=5,
             button=InlineQueryResultsButton(
-                text="Вставьте ссылку на YouTube видео",
+                text="Вставьте ссылку на YouTube, TikTok или Instagram",
                 start_parameter="help",
             ),
         )
         return
 
-    video_id = _get_video_id(url)
-    if not video_id:
+    media_id = _get_media_id(url)
+    if not media_id:
         await update.inline_query.answer([], cache_time=5)
         return
 
     # Fetch metadata on first encounter
-    if video_id not in _video_cache:
+    if media_id not in _video_cache:
         info = await _fetch_video_info(url)
         if not info:
             await update.inline_query.answer([], cache_time=5)
             return
-        _video_cache[video_id] = {
+        _video_cache[media_id] = {
             "url": url,
-            "title": info.get("title", "YouTube Video"),
+            "title": info.get("title", "Video"),
             "thumbnail": info.get("thumbnail"),
             "sizes": _estimate_sizes(info),
         }
 
-    cached = _video_cache[video_id]
+    cached = _video_cache[media_id]
     title = cached["title"]
     thumbnail = cached.get("thumbnail")
 
@@ -362,7 +423,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     sizes = cached.get("sizes", {})
     results = []
     for opt in QUALITY_OPTIONS:
-        cache_key = f"{video_id}|{opt['key']}"
+        cache_key = f"{media_id}|{opt['key']}"
         estimated = sizes.get(opt["key"])
 
         # Skip options that are definitely too large for Telegram
@@ -417,29 +478,29 @@ async def chosen_inline_result_handler(
     if chosen.result_id.endswith("|toobig"):
         return  # user tapped an oversized option, message already shows the error
 
-    video_id, quality_key = chosen.result_id.split("|", 1)
+    media_id, quality_key = chosen.result_id.split("|", 1)
     opt = _quality_map.get(quality_key)
-    cached = _video_cache.get(video_id)
+    cached = _video_cache.get(media_id)
 
     if not opt:
         logger.warning("chosen_inline_result: unknown quality key %r, skipping", quality_key)
         return
 
     if not cached:
-        # Cache miss: bot restarted or fetch hasn't finished yet — reconstruct from video_id
-        logger.info("chosen_inline_result: cache miss for %s, fetching info now", video_id)
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        # Cache miss: bot restarted — reconstruct URL from media_id
+        logger.info("chosen_inline_result: cache miss for %s, fetching info now", media_id)
+        url = _reconstruct_url(media_id)
         info = await _fetch_video_info(url)
         if not info:
             return
         cached = {
             "url": url,
-            "title": info.get("title", "YouTube Video"),
+            "title": info.get("title", "Video"),
             "thumbnail": info.get("thumbnail"),
         }
-        _video_cache[video_id] = cached
+        _video_cache[media_id] = cached
 
-    logger.info("Starting download: video_id=%s quality=%s", video_id, quality_key)
+    logger.info("Starting download: media_id=%s quality=%s", media_id, quality_key)
     # Fire-and-forget: download runs in background while the "Loading..." message is live
     asyncio.create_task(
         _download_and_update(
@@ -466,7 +527,8 @@ async def _download_and_update(
 ) -> None:
     is_audio: bool = opt["is_audio"]
     loop = asyncio.get_running_loop()
-    cache_key = f"{_get_video_id(url)}|{opt['key']}"
+    cache_key = f"{_get_media_id(url)}|{opt['key']}"
+    platform = _platform_name(url)
     logger.info("_download_and_update started: url=%s quality=%s", url, opt["key"])
 
     # --- Cache hit: skip download entirely ---
@@ -475,7 +537,7 @@ async def _download_and_update(
         file_id = _file_cache[cache_key]
         try:
             if is_audio:
-                media = InputMediaAudio(media=file_id, title=title, performer="YouTube")
+                media = InputMediaAudio(media=file_id, title=title, performer=platform)
             else:
                 media = InputMediaVideo(media=file_id, supports_streaming=True)
             await context.bot.edit_message_media(
@@ -544,7 +606,7 @@ async def _download_and_update(
                         chat_id=STORAGE_CHAT_ID,
                         audio=fh,
                         title=title,
-                        performer="YouTube",
+                        performer=platform,
                         write_timeout=300,
                         read_timeout=300,
                     )
@@ -553,7 +615,7 @@ async def _download_and_update(
                     media = InputMediaAudio(
                         media=sent.audio.file_id,
                         title=title,
-                        performer="YouTube",
+                        performer=platform,
                     )
                 else:
                     sent = await context.bot.send_video(
