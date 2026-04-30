@@ -213,14 +213,17 @@ async def _auto_update_ytdlp(context) -> None:
 
 def _extract_youtube_url(text: str) -> str | None:
     m = re.search(
-        r"https?://(?:www\.)?(?:"
+        r"https?://(?:(?:www|m)\.)?(?:"
         r"youtube\.com/watch\?[^\s]*v=[\w\-_]+"
         r"|youtu\.be/[\w\-_]+"
         r"|youtube\.com/shorts/[\w\-_]+"
         r")",
         text,
     )
-    return m.group(0) if m else None
+    if not m:
+        return None
+    video_id = _get_video_id(m.group(0))
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
 
 
 def _get_video_id(url: str) -> str | None:
